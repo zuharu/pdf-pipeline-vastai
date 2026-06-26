@@ -1,0 +1,24 @@
+# Secrets — NEVER commit API keys
+.env.vastai
+.env.deepseek
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Serena
+.serena/
+
+# IDE
+.idea/
+.vscode/
+
+# Docker
+*.tar
+
+# Output
+output/
+staging/
+input/
