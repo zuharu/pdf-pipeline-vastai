@@ -78,6 +78,40 @@ python3 monitor.py <INSTANCE_ID>
 | `template_config.json` | Vast.ai template payload |
 | `.github/workflows/docker-build.yml` | CI: build & push to GHCR |
 
+## Local Requirements (for orchestrate.py + monitor.py)
+
+These run on your local machine (not the GPU instance):
+
+### Python packages
+
+```bash
+pip install rich paramiko
+```
+
+| Package | Why | Used By |
+|---------|-----|---------|
+| `rich>=13.0` | Terminal tables, panels, progress bars, live display | orchestrate.py, monitor.py |
+| `paramiko>=3.0` | SSH client for log streaming (monitor.py) | monitor.py |
+
+### System tools
+
+```bash
+pip install vastai
+```
+
+| Tool | Why | Used By |
+|------|-----|---------|
+| `vastai` CLI | GPU search, SSH URL parsing, instance management | orchestrate.py, monitor.py |
+| `ssh` | SCP file transfer to instance | orchestrate.py |
+
+### Quick install
+
+```bash
+pip install rich paramiko vastai
+```
+
+> **Note:** `vastai` CLI requires `VAST_API_KEY` set in `.env.vastai` or via `vastai set api-key <KEY>`.
+
 ## Environment
 
 Two `.env` files are required:
