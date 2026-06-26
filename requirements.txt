@@ -1,0 +1,23 @@
+# PDF Ingestion Pipeline — Python dependencies
+# Installed on Vast.ai GPU instance (PyTorch 2.5.1 + CUDA 12.4 base image)
+
+# ── marker-pdf (GPU PDF extraction) ─────────────────────────────────────────
+marker-pdf
+
+# ── Surya compatibility pins (CRITICAL) ─────────────────────────────────────
+transformers>=4.45.2,<5.0.0
+regex<2025.0.0,>=2024.4.28
+
+# ── Image processing ────────────────────────────────────────────────────────
+opencv-python-headless
+Pillow>=10.0.0
+
+# ── API clients ─────────────────────────────────────────────────────────────
+openai>=1.0.0           # DeepSeek API (OpenAI-compatible)
+ollama>=0.4.0           # Ollama Python client (vision API)
+
+# ── Terminal UX ─────────────────────────────────────────────────────────────
+rich>=13.0.0
+
+# ── Config ──────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0
