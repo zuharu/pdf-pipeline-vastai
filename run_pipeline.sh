@@ -5,6 +5,7 @@
 #   Phase A: marker-pdf GPU extraction (Surya loaded once for all PDFs)
 #   Phase B: DeepSeek prompt generation (API call, no GPU)
 #   Phase C: Ollama VLM description (Qwen2.5-VL loaded once for all PDFs)
+#   Phase D: Cleanup (remove processed PDFs + staging, keep output)
 #
 # Usage (on instance):
 #   bash /workspace/run_pipeline.sh
@@ -219,6 +220,27 @@ done
 kill $OLLAMA_PID 2>/dev/null || true
 echo ""
 echo -e "${GREEN}[C] Phase C complete — all VLM descriptions done${NC}"
+
+# ── PHASE D: Cleanup processed files (keep output only) ─────────────────────
+echo ""
+echo -e "${CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
+echo -e "${CYAN}║  PHASE D: Cleanup (remove input PDFs + staging dirs)    ║${NC}"
+echo -e "${CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
+
+CLEANED_COUNT=0
+for pdf in "$INPUT_DIR"/*.pdf; do
+    BOOKNAME=$(basename "$pdf" .pdf)
+    # Only cleanup if output exists (pipeline succeeded)
+    if [ -f "$OUTPUT_DIR/${BOOKNAME}_enhanced.md" ]; then
+        rm -f "$pdf"
+        rm -rf "$STAGING_DIR/$BOOKNAME"
+        echo -e "${GREEN}[$(ts)][D] ✅ Cleaned: $BOOKNAME (PDF + staging removed, output kept)${NC}"
+        CLEANED_COUNT=$((CLEANED_COUNT + 1))
+    else
+        echo -e "${YELLOW}[$(ts)][D] ⏭️  $BOOKNAME: output not found, skipping cleanup${NC}"
+    fi
+done
+echo -e "${GREEN}[D] Phase D complete — cleaned $CLEANED_COUNT book(s)${NC}"
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
