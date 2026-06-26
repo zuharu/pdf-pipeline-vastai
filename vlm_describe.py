@@ -201,8 +201,9 @@ def assemble_enhanced_markdown(
         line = lines[i]
         result_lines.append(line)
 
-        # Detect figure reference
-        match = re.match(r'!\[.*?\]\((_page_\d+_\d+\.jpe?g)\)', line)
+        # Detect figure reference — matches marker-pdf format
+        # e.g. ![](_page_3_Figure_8.jpeg) or ![](_page_12_Picture_2.jpeg)
+        match = re.match(r'!\[.*?\]\((_page_\d+_[^.]+\.[jJ][pP][eE]?[gG])\)', line)
         if match:
             filename = match.group(1)
             fig_name = filename.replace(".jpeg", "").replace(".jpg", "")
@@ -302,10 +303,9 @@ def main():
 
     if not pending:
         console.print(f"[green]✅ All {len(figures)} figures already processed.[/]")
-        return
-
-    console.print(f"[VLM] Processing {len(pending)} pending figures "
-                  f"(model: {args.model}, workers: {args.max_workers})")
+    else:
+        console.print(f"[VLM] Processing {len(pending)} pending figures "
+                      f"(model: {args.model}, workers: {args.max_workers})")
 
     # Process
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -313,66 +313,65 @@ def main():
 
     lock = threading.Lock()
     descriptions = {}
-    errors = 0
+    errors_count = 0
     rate_limit_sem = threading.Semaphore(args.max_workers)
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        TimeRemainingColumn(),
-        console=console
-    ) as progress:
-        task = progress.add_task(f"[cyan]Describing {book_name}...", total=len(pending))
+    if pending:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeRemainingColumn(),
+            console=console
+        ) as progress:
+            task = progress.add_task(f"[cyan]Describing {book_name}...", total=len(pending))
 
-        def process_one(fig):
-            nonlocal errors
-            rate_limit_sem.acquire()
-            try:
-                cat = fig["category"]
-                prompt = prompt_config[cat]["prompt"]
-                desc = describe_figure(
-                    Path(fig["path"]),
-                    cat,
-                    prompt,
-                    model=args.model
-                )
-                with lock:
-                    descriptions[fig["name"]] = desc
-                    state["processed"][fig["name"]] = {
-                        "category": cat,
-                        "timestamp": str(datetime.now()),
-                        "chars": len(desc),
-                        "content": desc  # store full content for resume
-                    }
-                    save_state(job_dir, state)
-            except Exception as e:
-                with lock:
-                    errors += 1
-                    save_error(job_dir, fig["name"], str(e))
-                    console.print(f"[red]ERROR {fig['name']}:[/] {e}")
-                    import traceback
-                    console.print(f"[dim]{traceback.format_exc()}[/]")
-            finally:
-                rate_limit_sem.release()
-                progress.update(task, advance=1)
+            def process_one(fig):
+                nonlocal errors_count
+                rate_limit_sem.acquire()
+                try:
+                    cat = fig["category"]
+                    prompt = prompt_config[cat]["prompt"]
+                    desc = describe_figure(
+                        Path(fig["path"]),
+                        cat,
+                        prompt,
+                        model=args.model
+                    )
+                    with lock:
+                        descriptions[fig["name"]] = desc
+                        state["processed"][fig["name"]] = {
+                            "category": cat,
+                            "timestamp": str(datetime.now()),
+                            "chars": len(desc),
+                            "content": desc
+                        }
+                        save_state(job_dir, state)
+                except Exception as e:
+                    with lock:
+                        errors_count += 1
+                        save_error(job_dir, fig["name"], str(e))
+                        console.print(f"[red]ERROR {fig['name']}:[/] {e}")
+                        import traceback
+                        console.print(f"[dim]{traceback.format_exc()}[/]")
+                finally:
+                    rate_limit_sem.release()
+                    progress.update(task, advance=1)
 
-        with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
-            futures = [executor.submit(process_one, fig) for fig in pending]
-            for _ in as_completed(futures):
-                pass
+            with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+                futures = [executor.submit(process_one, fig) for fig in pending]
+                for _ in as_completed(futures):
+                    pass
 
-    # Summary
-    console.print(f"\n[bold]Results:[/] {len(descriptions)} described, {errors} errors")
+        console.print(f"\n[bold]Results:[/] {len(descriptions)} described, {errors_count} errors")
 
     # Merge current run descriptions with previously processed state
-    # CRITICAL: must include ALL processed figures (from this run + previous runs)
     all_descriptions = {
         **{k: v.get("content", "") if isinstance(v, dict) else v
            for k, v in state.get("processed", {}).items()
-           if k not in descriptions},  # previously processed (from state)
-        **descriptions,  # current run results take precedence
+           if k not in descriptions},
+        **descriptions,
     }
 
     output_path = book_dir / f"{book_name}_enhanced.md"
