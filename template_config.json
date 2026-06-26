@@ -1,0 +1,13 @@
+{
+  "name": "PDF Ingestion Pipeline",
+  "desc": "marker-pdf GPU extraction + DeepSeek prompt gen + Ollama Qwen2.5-VL figure description. Batch multi-PDF pipeline on a single GPU instance.",
+  "image": "ghcr.io/zuharu/pdf-pipeline-vastai",
+  "tag": "latest",
+  "env": "-e OLLAMA_NUM_PARALLEL=1 -e OLLAMA_HOST=0.0.0.0",
+  "onstart": "env | grep _ >> /etc/environment; mkdir -p /workspace/input /workspace/staging /workspace/output /workspace/output/logs; echo '=== PIPELINE READY ===' > /workspace/output/READY",
+  "runtype": "ssh",
+  "ssh_direct": true,
+  "use_ssh": true,
+  "recommended_disk_space": 50,
+  "private": true
+}
