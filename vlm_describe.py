@@ -98,20 +98,22 @@ def describe_figure(
 
     image_b64 = encode_image(image_path)
 
-    response = chat(
-        model=model,
-        messages=[{
-            "role": "user",
-            "content": f"{prompt}\n\nDescribe this {category} figure in detail. Output in structured markdown.",
-            "images": [image_b64]
-        }],
-        options={
-            "temperature": 0.3,
-            "num_predict": 1024
-        }
-    )
-
-    return response.message.content.strip()
+    try:
+        response = chat(
+            model=model,
+            messages=[{
+                "role": "user",
+                "content": f"{prompt}\n\nDescribe this {category} figure in detail. Output in structured markdown.",
+                "images": [image_b64]
+            }],
+            options={
+                "temperature": 0.3,
+                "num_predict": 1024
+            }
+        )
+        return response.message.content.strip()
+    except Exception as e:
+        raise RuntimeError(f"Ollama chat failed for {image_path.name}: {e}") from e
 
 
 # ── Figure Discovery ──────────────────────────────────────────────────────────
@@ -130,8 +132,9 @@ def discover_figures(book_dir: Path) -> list[dict]:
     with open(md_path, encoding="utf-8") as f:
         md_content = f.read()
 
-    # Find all figure references: ![...](_page_XXX_XXX.jpeg)
-    figure_refs = re.findall(r'!\[(.*?)\]\((_page_\d+_\d+\.jpe?g)\)', md_content)
+    # Find all figure references: ![...](_page_XXX_...jpeg)
+    # marker-pdf format: ![](_page_3_Figure_8.jpeg) or ![](_page_12_Picture_2.jpeg)
+    figure_refs = re.findall(r'!\[(.*?)\]\((_page_\d+_[^.]+\.[jJ][pP][eE]?[gG])\)', md_content)
 
     # Find all JPEGs on disk
     jpegs = {p.name: p for p in book_dir.glob("_page_*.jp*g")}
@@ -340,7 +343,8 @@ def main():
                     state["processed"][fig["name"]] = {
                         "category": cat,
                         "timestamp": str(datetime.now()),
-                        "chars": len(desc)
+                        "chars": len(desc),
+                        "content": desc  # store full content for resume
                     }
                     save_state(job_dir, state)
             except Exception as e:
@@ -348,6 +352,8 @@ def main():
                     errors += 1
                     save_error(job_dir, fig["name"], str(e))
                     console.print(f"[red]ERROR {fig['name']}:[/] {e}")
+                    import traceback
+                    console.print(f"[dim]{traceback.format_exc()}[/]")
             finally:
                 rate_limit_sem.release()
                 progress.update(task, advance=1)
@@ -360,9 +366,17 @@ def main():
     # Summary
     console.print(f"\n[bold]Results:[/] {len(descriptions)} described, {errors} errors")
 
-    # Assemble
+    # Merge current run descriptions with previously processed state
+    # CRITICAL: must include ALL processed figures (from this run + previous runs)
+    all_descriptions = {
+        **{k: v.get("content", "") if isinstance(v, dict) else v
+           for k, v in state.get("processed", {}).items()
+           if k not in descriptions},  # previously processed (from state)
+        **descriptions,  # current run results take precedence
+    }
+
     output_path = book_dir / f"{book_name}_enhanced.md"
-    inserted = assemble_enhanced_markdown(md_path, figures, descriptions, output_path)
+    inserted = assemble_enhanced_markdown(md_path, figures, all_descriptions, output_path)
     console.print(f"[green]✅ Assembled {output_path} ({inserted} VLM descriptions inserted)[/]")
 
 
