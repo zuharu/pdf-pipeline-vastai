@@ -3,17 +3,19 @@
 vlm_describe.py — Describe figures via self-hosted Ollama VLM.
 
 Phase 3 of PDF Ingestion Pipeline (runs on Vast.ai GPU instance):
-  Takes prompt_config.json + figure JPEGs, processes each figure
+  Takes figure_metadata.json + figure JPEGs, processes each figure
   via Ollama (Qwen2.5-VL-7B-Instruct), saves results, assembles <book>_enhanced.md.
 
 Resumable — state saved to .vlm_job/ in the staging directory.
+
+Requires: figure_metadata.json from vlm_prompt_gen.py (Phase B)
 
 Usage:
     python3 /workspace/vlm_describe.py /workspace/staging/<bookname>/
     python3 /workspace/vlm_describe.py /workspace/staging/<bookname>/ --max-workers 4
     python3 /workspace/vlm_describe.py /workspace/staging/<bookname>/ --status
 
-API: ollama Python client — ollama.chat(model, messages=[{images: […]}])
+API: ollama Python client — ollama.chat(model, messages=[{images: [...]}])
 Ref:  https://context7.com/ollama/ollama-python — Vision API with images parameter
 """
 
@@ -70,6 +72,70 @@ def save_error(job_dir: Path, figure_name: str, error: str):
         json.dump(errors, f, indent=2)
 
 
+# ── Figure Metadata Loading ────────────────────────────────────────────────────
+def load_figure_metadata(book_dir: Path) -> dict:
+    """
+    Load figure_metadata.json — the data contract from Phase B.
+
+    Returns: {
+        "book_context": str,
+        "category_prompts": dict,
+        "figures": [{"filename", "name", "caption", "category", "prompt", "path"}, ...]
+    }
+
+    Errors if file not found or malformed.
+    """
+    metadata_path = book_dir / "figure_metadata.json"
+    if not metadata_path.exists():
+        console.print(
+            f"[red]ERROR:[/] figure_metadata.json not found in {book_dir}\n"
+            f"Run vlm_prompt_gen.py (Phase B) first to generate it."
+        )
+        sys.exit(1)
+
+    with open(metadata_path, encoding="utf-8") as f:
+        metadata = json.load(f)
+
+    # Validate structure
+    if "figures" not in metadata:
+        console.print("[red]ERROR:[/] figure_metadata.json missing 'figures' key")
+        sys.exit(1)
+
+    # Validate each figure entry has required fields
+    for fig in metadata["figures"]:
+        if "name" not in fig:
+            console.print(f"[red]ERROR:[/] Figure entry missing 'name': {fig}")
+            sys.exit(1)
+        if "category" not in fig:
+            fig["category"] = "other_unknown"
+        if "prompt" not in fig:
+            fig["prompt"] = "Describe this figure in detail."
+
+    # Build path lookup: map figure name to JPEG on disk
+    jpegs = {p.name: str(p) for p in book_dir.glob("_page_*.jp*g")}
+    missing = 0
+    for fig in metadata["figures"]:
+        filename = fig.get("filename", "")
+        if filename in jpegs:
+            fig["path"] = jpegs[filename]
+        else:
+            # Try alternative extensions
+            name = fig["name"]
+            found = False
+            for ext in [".jpeg", ".jpg", ".JPEG", ".JPG"]:
+                if name + ext in jpegs:
+                    fig["path"] = jpegs[name + ext]
+                    fig["filename"] = name + ext
+                    found = True
+                    break
+            if not found:
+                missing += 1
+
+    if missing > 0:
+        console.print(f"[yellow]WARN:[/] {missing} figures have no JPEG on disk")
+
+    return metadata
+
 # ── Image Encoding ────────────────────────────────────────────────────────────
 def encode_image(image_path: Path) -> str:
     """Read image file, return base64 encoded string for Ollama vision API."""
@@ -89,7 +155,7 @@ def describe_figure(
     Args:
         image_path: Path to JPEG image
         category: Figure category (circuit, graph, block_diagram, photo)
-        prompt: VLM prompt for this category from prompt_config.json
+        prompt: VLM prompt for this category from figure_metadata.json
         model: Ollama model tag
     Returns:
         Markdown description string
@@ -114,71 +180,6 @@ def describe_figure(
         return response.message.content.strip()
     except Exception as e:
         raise RuntimeError(f"Ollama chat failed for {image_path.name}: {e}") from e
-
-
-# ── Figure Discovery ──────────────────────────────────────────────────────────
-def discover_figures(book_dir: Path) -> list[dict]:
-    """
-    Find all figure JPEGs and their captions from markdown.
-    Returns list of {name, path, caption, category}.
-    """
-    # Find markdown
-    md_files = list(book_dir.glob("*.md"))
-    if not md_files:
-        return []
-    md_path = md_files[0]
-
-    # Parse figure references from markdown
-    with open(md_path, encoding="utf-8") as f:
-        md_content = f.read()
-
-    # Find all figure references: ![...](_page_XXX_...jpeg)
-    # marker-pdf format: ![](_page_3_Figure_8.jpeg) or ![](_page_12_Picture_2.jpeg)
-    figure_refs = re.findall(r'!\[(.*?)\]\((_page_\d+_[^.]+\.[jJ][pP][eE]?[gG])\)', md_content)
-
-    # Find all JPEGs on disk
-    jpegs = {p.name: p for p in book_dir.glob("_page_*.jp*g")}
-
-    figures = []
-    for caption, filename in figure_refs:
-        if filename in jpegs:
-            figures.append({
-                "name": filename.replace(".jpeg", "").replace(".jpg", ""),
-                "path": str(jpegs[filename]),
-                "caption": caption.strip(),
-                "category": "unknown"  # Will be assigned later
-            })
-
-    return figures
-
-
-def classify_figures(figures: list[dict], prompt_config: dict) -> list[dict]:
-    """Assign category to each figure based on caption keywords."""
-    category_keywords = {
-        "circuit": ["circuit", "schematic", "amplifier", "oscillator", "filter",
-                     "transistor", "diode", "op-amp", "op amp", "voltage",
-                     "current", "signal", "bias", "bjt", "mosfet", "fet"],
-        "graph": ["plot", "graph", "curve", "response", "characteristic",
-                   "frequency", "gain", "phase", "bode", "impedance",
-                   "transfer function", "v/i", "i-v"],
-        "block_diagram": ["block diagram", "block", "system", "architecture",
-                          "flow", "pipeline", "stage", "module"],
-        "photo": ["photo", "photograph", "apparatus", "setup", "equipment",
-                   "oscilloscope", "lab", "breadboard", "pcb", "board"]
-    }
-
-    for fig in figures:
-        caption_lower = (fig["caption"] + " " + fig["name"]).lower()
-        best_cat = "graph"  # default
-        best_score = 0
-        for cat, keywords in category_keywords.items():
-            score = sum(1 for kw in keywords if kw in caption_lower)
-            if score > best_score:
-                best_score = score
-                best_cat = cat
-        fig["category"] = best_cat
-
-    return figures
 
 
 # ── Assembly ──────────────────────────────────────────────────────────────────
@@ -255,23 +256,23 @@ def main():
     md_path = md_files[0]
     book_name = md_path.stem
 
-    # Check prompt_config.json exists
-    pconfig_path = book_dir / "prompt_config.json"
-    if not pconfig_path.exists():
-        console.print("[red]ERROR:[/] prompt_config.json not found. Run vlm_prompt_gen.py first.")
-        sys.exit(1)
-
-    with open(pconfig_path) as f:
-        prompt_config = json.load(f)
-
     # Setup job directory
     job_dir = book_dir / ".vlm_job"
     job_dir.mkdir(exist_ok=True)
 
-    # Discover figures
-    figures = discover_figures(book_dir)
-    figures = classify_figures(figures, prompt_config)
-    console.print(f"[VLM] Found {len(figures)} figures in {book_name}")
+    # Load figure metadata from Phase B (replaces discover_figures + classify_figures)
+    metadata = load_figure_metadata(book_dir)
+    figures = metadata["figures"]
+    category_prompts = metadata.get("category_prompts", {})
+
+    # Print category distribution
+    cat_counts = {}
+    for fig in figures:
+        cat = fig.get("category", "other_unknown")
+        cat_counts[cat] = cat_counts.get(cat, 0) + 1
+    console.print(f"[VLM] Found {len(figures)} figures in {book_name}:")
+    for cat in sorted(cat_counts.keys()):
+        console.print(f"  {cat}: {cat_counts[cat]}")
 
     if args.status:
         state = load_state(job_dir)
@@ -295,10 +296,16 @@ def main():
     for fig in figures:
         if not args.force and fig["name"] in state.get("processed", {}):
             continue
-        cat = fig["category"]
-        if cat not in prompt_config:
-            console.print(f"[yellow]WARN:[/] No prompt for category '{cat}', skipping {fig['name']}")
+        cat = fig.get("category", "other_unknown")
+        prompt = fig.get("prompt", "")
+        if not prompt:
+            # Fallback: use category_prompts from metadata
+            prompt = category_prompts.get(cat, {}).get("prompt", "")
+        if not prompt:
+            console.print(f"[yellow]WARN:[/] No prompt for '{fig['name']}' (category: {cat}), skipping")
             continue
+        # Store prompt on the figure dict for process_one() to use
+        fig["_prompt"] = prompt
         pending.append(fig)
 
     if not pending:
@@ -313,65 +320,66 @@ def main():
 
     lock = threading.Lock()
     descriptions = {}
-    errors_count = 0
+    errors = 0
     rate_limit_sem = threading.Semaphore(args.max_workers)
 
-    if pending:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            TimeRemainingColumn(),
-            console=console
-        ) as progress:
-            task = progress.add_task(f"[cyan]Describing {book_name}...", total=len(pending))
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeRemainingColumn(),
+        console=console
+    ) as progress:
+        task = progress.add_task(f"[cyan]Describing {book_name}...", total=len(pending))
 
-            def process_one(fig):
-                nonlocal errors_count
-                rate_limit_sem.acquire()
-                try:
-                    cat = fig["category"]
-                    prompt = prompt_config[cat]["prompt"]
-                    desc = describe_figure(
-                        Path(fig["path"]),
-                        cat,
-                        prompt,
-                        model=args.model
-                    )
-                    with lock:
-                        descriptions[fig["name"]] = desc
-                        state["processed"][fig["name"]] = {
-                            "category": cat,
-                            "timestamp": str(datetime.now()),
-                            "chars": len(desc),
-                            "content": desc
-                        }
-                        save_state(job_dir, state)
-                except Exception as e:
-                    with lock:
-                        errors_count += 1
-                        save_error(job_dir, fig["name"], str(e))
-                        console.print(f"[red]ERROR {fig['name']}:[/] {e}")
-                        import traceback
-                        console.print(f"[dim]{traceback.format_exc()}[/]")
-                finally:
-                    rate_limit_sem.release()
-                    progress.update(task, advance=1)
+        def process_one(fig):
+            nonlocal errors
+            rate_limit_sem.acquire()
+            try:
+                cat = fig["category"]
+                prompt = fig.get("_prompt", "")
+                desc = describe_figure(
+                    Path(fig["path"]),
+                    cat,
+                    prompt,
+                    model=args.model
+                )
+                with lock:
+                    descriptions[fig["name"]] = desc
+                    state["processed"][fig["name"]] = {
+                        "category": cat,
+                        "timestamp": str(datetime.now()),
+                        "chars": len(desc),
+                        "content": desc  # store full content for resume
+                    }
+                    save_state(job_dir, state)
+            except Exception as e:
+                with lock:
+                    errors += 1
+                    save_error(job_dir, fig["name"], str(e))
+                    console.print(f"[red]ERROR {fig['name']}:[/] {e}")
+                    import traceback
+                    console.print(f"[dim]{traceback.format_exc()}[/]")
+            finally:
+                rate_limit_sem.release()
+                progress.update(task, advance=1)
 
-            with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
-                futures = [executor.submit(process_one, fig) for fig in pending]
-                for _ in as_completed(futures):
-                    pass
+        with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+            futures = [executor.submit(process_one, fig) for fig in pending]
+            for _ in as_completed(futures):
+                pass
 
-        console.print(f"\n[bold]Results:[/] {len(descriptions)} described, {errors_count} errors")
+    # Summary
+    console.print(f"\n[bold]Results:[/] {len(descriptions)} described, {errors} errors")
 
     # Merge current run descriptions with previously processed state
+    # CRITICAL: must include ALL processed figures (from this run + previous runs)
     all_descriptions = {
         **{k: v.get("content", "") if isinstance(v, dict) else v
            for k, v in state.get("processed", {}).items()
-           if k not in descriptions},
-        **descriptions,
+           if k not in descriptions},  # previously processed (from state)
+        **descriptions,  # current run results take precedence
     }
 
     output_path = book_dir / f"{book_name}_enhanced.md"
