@@ -1,237 +1,207 @@
 #!/usr/bin/env python3
 """
-vlm_describe.py — Describe figures via self-hosted Ollama VLM.
-
-Phase 3 of PDF Ingestion Pipeline (runs on Vast.ai GPU instance):
-  Takes figure_metadata.json + figure JPEGs, processes each figure
-  via Ollama (Qwen2.5-VL-7B-Instruct), saves results, assembles <book>_enhanced.md.
-
-Resumable — state saved to .vlm_job/ in the staging directory.
-
-Requires: figure_metadata.json from vlm_prompt_gen.py (Phase B)
+vlm_describe.py — VLM Figure Description via Ollama (Qwen2.5-VL-7B).
+Phase C of PDF Ingestion Pipeline.
+Reads figure_metadata.json from Phase B, describes each figure via Ollama VLM,
+and assembles enhanced markdown with VLM descriptions.
 
 Usage:
-    python3 /workspace/vlm_describe.py /workspace/staging/<bookname>/
-    python3 /workspace/vlm_describe.py /workspace/staging/<bookname>/ --max-workers 4
-    python3 /workspace/vlm_describe.py /workspace/staging/<bookname>/ --status
+  python3 /workspace/vlm_describe.py /workspace/staging/<bookname>/
+  python3 /workspace/vlm_describe.py /workspace/staging/<bookname>/ --sample 5
 
-API: ollama Python client — ollama.chat(model, messages=[{images: [...]}])
-Ref:  https://context7.com/ollama/ollama-python — Vision API with images parameter
+Ref: Context7 Ollama docs — chat with images, temperature, num_predict
 """
 
-import re
+import os
 import sys
 import json
-import argparse
 import base64
+import argparse
+import threading
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ── Rich ──────────────────────────────────────────────────────────────────────
 from rich.console import Console
 from rich.progress import (
-    Progress, BarColumn, TextColumn, TaskProgressColumn,
-    TimeRemainingColumn, SpinnerColumn,
+    Progress, SpinnerColumn, TextColumn,
+    BarColumn, TaskProgressColumn, TimeRemainingColumn
 )
 
 console = Console()
 
-# ── Config ────────────────────────────────────────────────────────────────────
-OLLAMA_MODEL = "qwen2.5vl:7b"  # Qwen2.5-VL-7B-Instruct (Q4_K_M, 6.5 GB VRAM)
-DEFAULT_MAX_WORKERS = 2         # Conservative — leave VRAM headroom
+OLLAMA_MODEL = "qwen2.5vl:7b"
+DEFAULT_MAX_WORKERS = 2
 
 
 # ── State Management ──────────────────────────────────────────────────────────
+
 def load_state(job_dir: Path) -> dict:
-    """Load resume state, return empty if none."""
+    """Load job state from .vlm_job/state.json."""
     state_file = job_dir / "state.json"
     if state_file.exists():
-        with open(state_file) as f:
+        with open(state_file, encoding="utf-8") as f:
             return json.load(f)
-    return {"processed": {}, "errors": {}, "started_at": None, "updated_at": None}
+    return {"processed": {}, "started_at": None}
 
 
 def save_state(job_dir: Path, state: dict):
-    state["updated_at"] = str(datetime.now())
-    with open(job_dir / "state.json", "w") as f:
-        json.dump(state, f, indent=2)
+    """Save job state."""
+    state_file = job_dir / "state.json"
+    with open(state_file, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+
+
+def save_error(job_dir: Path, figure_name: str, error_msg: str):
+    """Record a per-figure error."""
+    err_file = job_dir / "errors.json"
+    errors = {}
+    if err_file.exists():
+        with open(err_file, encoding="utf-8") as f:
+            errors = json.load(f)
+    errors[figure_name] = {"error": error_msg, "timestamp": str(datetime.now())}
+    with open(err_file, "w", encoding="utf-8") as f:
+        json.dump(errors, f, indent=2, ensure_ascii=False)
 
 
 def load_errors(job_dir: Path) -> dict:
+    """Load error log."""
     err_file = job_dir / "errors.json"
     if err_file.exists():
-        with open(err_file) as f:
+        with open(err_file, encoding="utf-8") as f:
             return json.load(f)
     return {}
 
 
-def save_error(job_dir: Path, figure_name: str, error: str):
-    errors = load_errors(job_dir)
-    errors[figure_name] = {"error": str(error), "timestamp": str(datetime.now())}
-    with open(job_dir / "errors.json", "w") as f:
-        json.dump(errors, f, indent=2)
+# ── Figure Metadata (from Phase B) ────────────────────────────────────────────
 
-
-# ── Figure Metadata Loading ────────────────────────────────────────────────────
 def load_figure_metadata(book_dir: Path) -> dict:
-    """
-    Load figure_metadata.json — the data contract from Phase B.
-
-    Returns: {
-        "book_context": str,
-        "category_prompts": dict,
-        "figures": [{"filename", "name", "caption", "category", "prompt", "path"}, ...]
-    }
-
-    Errors if file not found or malformed.
-    """
+    """Load figure_metadata.json — the data contract from Phase B."""
     metadata_path = book_dir / "figure_metadata.json"
     if not metadata_path.exists():
-        console.print(
-            f"[red]ERROR:[/] figure_metadata.json not found in {book_dir}\n"
-            f"Run vlm_prompt_gen.py (Phase B) first to generate it."
-        )
+        console.print(f"[red]ERROR:[/] {metadata_path} not found")
+        console.print("Run vlm_prompt_gen.py (Phase B) first to generate figure metadata.")
         sys.exit(1)
 
     with open(metadata_path, encoding="utf-8") as f:
         metadata = json.load(f)
 
-    # Validate structure
-    if "figures" not in metadata:
-        console.print("[red]ERROR:[/] figure_metadata.json missing 'figures' key")
-        sys.exit(1)
+    # Map JPEG files to figure entries
+    jpeg_map = {}
+    for jpeg_path in book_dir.glob("_page_*.jp*g"):
+        filename = jpeg_path.name
+        jpeg_map[filename] = str(jpeg_path)
 
-    # Validate each figure entry has required fields
-    for fig in metadata["figures"]:
-        if "name" not in fig:
-            console.print(f"[red]ERROR:[/] Figure entry missing 'name': {fig}")
-            sys.exit(1)
-        if "category" not in fig:
-            fig["category"] = "other_unknown"
-        if "prompt" not in fig:
-            fig["prompt"] = "Describe this figure in detail."
+    # Also check nested dir
+    nested_dir = None
+    for d in book_dir.iterdir():
+        if d.is_dir() and any(d.glob("_page_*.jp*g")):
+            nested_dir = d
+            break
+    if nested_dir:
+        for jpeg_path in nested_dir.glob("_page_*.jp*g"):
+            if jpeg_path.name not in jpeg_map:
+                jpeg_map[jpeg_path.name] = str(jpeg_path)
 
-    # Build path lookup: map figure name to JPEG on disk
-    jpegs = {p.name: str(p) for p in book_dir.glob("_page_*.jp*g")}
-    missing = 0
-    for fig in metadata["figures"]:
+    for fig in metadata.get("figures", []):
         filename = fig.get("filename", "")
-        if filename in jpegs:
-            fig["path"] = jpegs[filename]
+        if filename in jpeg_map:
+            fig["path"] = jpeg_map[filename]
         else:
-            # Try alternative extensions
-            name = fig["name"]
-            found = False
-            for ext in [".jpeg", ".jpg", ".JPEG", ".JPG"]:
-                if name + ext in jpegs:
-                    fig["path"] = jpegs[name + ext]
-                    fig["filename"] = name + ext
-                    found = True
-                    break
-            if not found:
-                missing += 1
-
-    if missing > 0:
-        console.print(f"[yellow]WARN:[/] {missing} figures have no JPEG on disk")
+            fig["path"] = str(book_dir / filename)
 
     return metadata
 
-# ── Image Encoding ────────────────────────────────────────────────────────────
-def encode_image(image_path: Path) -> str:
-    """Read image file, return base64 encoded string for Ollama vision API."""
-    return base64.b64encode(image_path.read_bytes()).decode()
-
 
 # ── VLM Description ───────────────────────────────────────────────────────────
-def describe_figure(
-    image_path: Path,
-    category: str,
-    prompt: str,
-    model: str = OLLAMA_MODEL
-) -> str:
-    """
-    Call Ollama vision API to describe a single figure.
 
-    Args:
-        image_path: Path to JPEG image
-        category: Figure category (circuit, graph, block_diagram, photo)
-        prompt: VLM prompt for this category from figure_metadata.json
-        model: Ollama model tag
-    Returns:
-        Markdown description string
-    """
+def describe_figure(image_path: Path, category: str, prompt: str, model: str = OLLAMA_MODEL) -> str:
+    """Call Ollama VLM to describe a single figure."""
     from ollama import chat
 
-    image_b64 = encode_image(image_path)
+    if not image_path or not image_path.exists():
+        raise FileNotFoundError(f"Image not found: {image_path}")
 
-    try:
-        response = chat(
-            model=model,
-            messages=[{
-                "role": "user",
-                "content": f"{prompt}\n\nDescribe this {category} figure in detail. Output in structured markdown.",
-                "images": [image_b64]
-            }],
-            options={
-                "temperature": 0.3,
-                "num_predict": 1024
-            }
-        )
-        return response.message.content.strip()
-    except Exception as e:
-        raise RuntimeError(f"Ollama chat failed for {image_path.name}: {e}") from e
+    with open(image_path, "rb") as f:
+        img_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    full_prompt = f"{prompt}\n\nFigure category: {category}"
+
+    response = chat(
+        model=model,
+        messages=[{
+            "role": "user",
+            "content": full_prompt,
+            "images": [img_b64]
+        }],
+        options={
+            "temperature": 0.3,
+            "num_predict": 1024
+        }
+    )
+
+    return response["message"]["content"].strip()
 
 
-# ── Assembly ──────────────────────────────────────────────────────────────────
-def assemble_enhanced_markdown(
-    md_path: Path,
-    figures: list[dict],
-    descriptions: dict[str, str],
-    output_path: Path
-):
-    """Insert VLM descriptions into markdown, produce _enhanced.md."""
+# ── Enhanced Markdown Assembly ─────────────────────────────────────────────────
+
+def assemble_enhanced_markdown(md_path: Path, figures: list[dict],
+                               descriptions: dict[str, str],
+                               output_path: Path) -> int:
+    """Insert VLM descriptions into markdown after each figure reference."""
     with open(md_path, encoding="utf-8") as f:
-        content = f.read()
+        lines = f.readlines()
 
-    lines = content.split("\n")
-    result_lines = []
-    i = 0
+    # Build lookup: _page_31_Figure_6 → name without extension
+    name_to_desc = {}
+    for desc_name, desc_text in descriptions.items():
+        # desc_name might be "_page_31_Figure_6" (from discover) or full path
+        clean = desc_name.split("/")[-1].replace(".jpeg", "").replace(".jpg", "")
+        name_to_desc[clean] = desc_text
+
+    # Also index by filename
+    for fig in figures:
+        name = fig.get("name", "")
+        if name in name_to_desc:
+            key = name
+        else:
+            key = fig.get("filename", "").replace(".jpeg", "").replace(".jpg", "")
+        if key not in name_to_desc:
+            continue
+
+    new_lines = []
     inserted = 0
 
-    while i < len(lines):
-        line = lines[i]
-        result_lines.append(line)
-
-        # Detect figure reference — matches marker-pdf format
-        # e.g. ![](_page_3_Figure_8.jpeg) or ![](_page_12_Picture_2.jpeg)
-        match = re.match(r'!\[.*?\]\((_page_\d+_[^.]+\.[jJ][pP][eE]?[gG])\)', line)
-        if match:
-            filename = match.group(1)
-            fig_name = filename.replace(".jpeg", "").replace(".jpg", "")
-            if fig_name in descriptions:
-                desc = descriptions[fig_name]
-                # Find matching figure metadata
-                fig_meta = next((f for f in figures if f["name"] == fig_name), None)
-                cat = fig_meta["category"] if fig_meta else "unknown"
-
-                result_lines.append("")
-                result_lines.append("<details>")
-                result_lines.append(f"<summary><b>🤖 VLM Description</b> ({cat})</summary>")
-                result_lines.append("")
-                result_lines.append(desc)
-                result_lines.append("")
-                result_lines.append("</details>")
-                inserted += 1
-
-        i += 1
+    for line in lines:
+        new_lines.append(line)
+        if line.startswith("![") and "(_page_" in line:
+            match = __import__("re").match(
+                r'!\[(.*?)\]\((_page_\d+_[^.]+.[jJ][pP][eE]?[gG])\)', line.strip()
+            )
+            if match:
+                filename = match.group(2)
+                name = filename.replace(".jpeg", "").replace(".jpg", "")
+                name_no_ext = __import__("re").sub(r'\.[jJ][pP][eE]?[gG]$', '', filename)
+                cat = "unknown"
+                for fig in figures:
+                    if fig.get("filename") == filename or fig.get("name") == name_no_ext:
+                        cat = fig.get("category", "unknown")
+                        break
+                desc = name_to_desc.get(name, name_to_desc.get(name_no_ext, ""))
+                if desc:
+                    new_lines.append(f"\n<details>\n<summary><b>🤖 VLM Description</b> ({cat})</summary>\n\n")
+                    new_lines.append(desc)
+                    new_lines.append("\n</details>\n")
+                    inserted += 1
 
     with open(output_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(result_lines))
+        f.writelines(new_lines)
 
     return inserted
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+
 def main():
     parser = argparse.ArgumentParser(description="Describe figures via Ollama VLM")
     parser.add_argument("book_dir", help="Path to book staging directory")
@@ -248,7 +218,6 @@ def main():
         console.print(f"[red]ERROR:[/] Directory not found: {book_dir}")
         sys.exit(1)
 
-    # Find markdown
     md_files = list(book_dir.glob("*.md"))
     if not md_files:
         console.print(f"[red]ERROR:[/] No .md file found in {book_dir}")
@@ -256,16 +225,13 @@ def main():
     md_path = md_files[0]
     book_name = md_path.stem
 
-    # Setup job directory
     job_dir = book_dir / ".vlm_job"
     job_dir.mkdir(exist_ok=True)
 
-    # Load figure metadata from Phase B (replaces discover_figures + classify_figures)
     metadata = load_figure_metadata(book_dir)
     figures = metadata["figures"]
     category_prompts = metadata.get("category_prompts", {})
 
-    # Print category distribution
     cat_counts = {}
     for fig in figures:
         cat = fig.get("category", "other_unknown")
@@ -280,18 +246,15 @@ def main():
         console.print(f"[VLM] Processed: {len(state.get('processed', {}))}, Errors: {len(errors)}")
         return
 
-    # Apply sample limit
     if args.sample > 0:
         figures = figures[:args.sample]
         console.print(f"[VLM] Sample mode: {len(figures)} figures")
 
-    # Load state
     state = load_state(job_dir)
     if not state.get("started_at"):
         state["started_at"] = str(datetime.now())
     save_state(job_dir, state)
 
-    # Filter already-processed
     pending = []
     for fig in figures:
         if not args.force and fig["name"] in state.get("processed", {}):
@@ -299,12 +262,10 @@ def main():
         cat = fig.get("category", "other_unknown")
         prompt = fig.get("prompt", "")
         if not prompt:
-            # Fallback: use category_prompts from metadata
             prompt = category_prompts.get(cat, {}).get("prompt", "")
         if not prompt:
             console.print(f"[yellow]WARN:[/] No prompt for '{fig['name']}' (category: {cat}), skipping")
             continue
-        # Store prompt on the figure dict for process_one() to use
         fig["_prompt"] = prompt
         pending.append(fig)
 
@@ -313,10 +274,6 @@ def main():
     else:
         console.print(f"[VLM] Processing {len(pending)} pending figures "
                       f"(model: {args.model}, workers: {args.max_workers})")
-
-    # Process
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    import threading
 
     lock = threading.Lock()
     descriptions = {}
@@ -351,16 +308,16 @@ def main():
                         "category": cat,
                         "timestamp": str(datetime.now()),
                         "chars": len(desc),
-                        "content": desc  # store full content for resume
+                        "content": desc
                     }
                     save_state(job_dir, state)
+                    done = len(state.get("processed", {}))
+                    print(f"[VLM] {done}/{len(figures)} {fig['name']} ({cat})", flush=True)
             except Exception as e:
                 with lock:
                     errors += 1
                     save_error(job_dir, fig["name"], str(e))
                     console.print(f"[red]ERROR {fig['name']}:[/] {e}")
-                    import traceback
-                    console.print(f"[dim]{traceback.format_exc()}[/]")
             finally:
                 rate_limit_sem.release()
                 progress.update(task, advance=1)
@@ -370,16 +327,13 @@ def main():
             for _ in as_completed(futures):
                 pass
 
-    # Summary
     console.print(f"\n[bold]Results:[/] {len(descriptions)} described, {errors} errors")
 
-    # Merge current run descriptions with previously processed state
-    # CRITICAL: must include ALL processed figures (from this run + previous runs)
     all_descriptions = {
         **{k: v.get("content", "") if isinstance(v, dict) else v
            for k, v in state.get("processed", {}).items()
-           if k not in descriptions},  # previously processed (from state)
-        **descriptions,  # current run results take precedence
+           if k not in descriptions},
+        **descriptions,
     }
 
     output_path = book_dir / f"{book_name}_enhanced.md"
